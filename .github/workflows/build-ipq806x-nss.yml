@@ -18,15 +18,21 @@ concurrency:
 
 jobs:
   build:
-    name: Build ${{ matrix.device }}
+    name: Build ${{ matrix.device }} (${{ matrix.variant }})
     runs-on: ubuntu-24.04
     timeout-minutes: 360
+    # An experimental variant may fail without blocking the release job.
+    continue-on-error: ${{ matrix.experimental }}
+    env:
+      CCACHE_MAXSIZE: 2G
     strategy:
       fail-fast: false
       matrix:
         include:
           - device: netgear_r7800
+            variant: std
             seed: diff
+            experimental: false
 
     steps:
       - name: Free disk space
@@ -56,6 +62,15 @@ jobs:
           key: dl-${{ matrix.device }}-${{ hashFiles('feeds.conf.default', matrix.seed) }}
           restore-keys: dl-${{ matrix.device }}-
 
+      # OpenWrt keeps the ccache in ./.ccache when CONFIG_CCACHE_DIR is empty.
+      - name: Cache compiler output (ccache)
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-${{ matrix.device }}-${{ matrix.variant }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ matrix.device }}-${{ matrix.variant }}-
+
       - name: Update feeds
         run: |
           ./scripts/feeds update -a
@@ -65,7 +80,33 @@ jobs:
       - name: Configure
         run: |
           cp ${{ matrix.seed }} .config
+          # ccache is enabled for CI only, so local builds of the seed are unaffected
+          echo 'CONFIG_CCACHE=y' >> .config
           make defconfig
+
+      # Warn about seed lines that "make defconfig" silently dropped (renamed or
+      # removed packages, unmet dependencies). Checked before the long build.
+      - name: Check seed survived defconfig
+        run: |
+          grep '^CONFIG_' "${{ matrix.seed }}" | sed 's/[[:space:]]*$//' > seed.lines
+          : > dropped.txt
+          while IFS= read -r line; do
+            grep -qxF -- "$line" .config || echo "$line" >> dropped.txt
+          done < seed.lines
+          if [ -s dropped.txt ]; then
+            while IFS= read -r line; do
+              echo "::warning::dropped by defconfig: $line"
+            done < dropped.txt
+            {
+              echo "### Seed lines dropped by defconfig (${{ matrix.variant }})"
+              echo '```'
+              cat dropped.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "All seed lines survived defconfig."
+          fi
+          rm -f seed.lines dropped.txt
 
       - name: Download sources
         run: make -j8 download
@@ -83,13 +124,19 @@ jobs:
           mkdir -p out
           cp bin/targets/ipq806x/generic/openwrt-nss-*-${{ matrix.device }}-* out/
           cp bin/targets/ipq806x/generic/openwrt-nss-*-${{ matrix.device }}.manifest out/
-          (cd out && sha256sum * > sha256sums-${{ matrix.device }})
+          # Non-std variants get their name in the file names so releases never collide.
+          if [ "${{ matrix.variant }}" != "std" ]; then
+            for f in out/*; do
+              mv "$f" "out/$(basename "$f" | sed 's/^openwrt-nss-/openwrt-nss-${{ matrix.variant }}-/')"
+            done
+          fi
+          (cd out && sha256sum * > sha256sums-${{ matrix.device }}-${{ matrix.variant }})
           ls -la out
 
       - name: Upload images
         uses: actions/upload-artifact@v4
         with:
-          name: openwrt-nss-${{ matrix.device }}
+          name: openwrt-nss-${{ matrix.device }}-${{ matrix.variant }}
           path: out/
           retention-days: 30
 
