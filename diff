@@ -1,4 +1,4 @@
-## Use "make defconfig" to expand this to a full .config
+ ## Use "make defconfig" to expand this to a full .config
 ## Target
 CONFIG_TARGET_ipq806x_generic_DEVICE_netgear_r7800=y
 CONFIG_TARGET_ipq806x_generic=y
@@ -8,6 +8,16 @@ CONFIG_EXPERIMENTAL=y
 CONFIG_DEVEL=y
 CONFIG_RUST_TOOLCHAINOPTS=y
 # CONFIG_KERNEL_RUST is not set
+
+CONFIG_TOOLCHAINOPTS=y
+CONFIG_GCC_USE_VERSION_15=y
+CONFIG_TARGET_OPTIONS=y
+CONFIG_TARGET_OPTIMIZATION="-O3 -pipe"
+CONFIG_EXTRA_OPTIMIZATION="-fno-caller-saves -fno-plt -fno-unwind-tables -fno-asynchronous-unwind-tables"
+CONFIG_USE_GC_SECTIONS=y
+CONFIG_USE_LTO=y
+CONFIG_USE_MOLD=y
+CONFIG_GCC_USE_GRAPHITE=y
 
 ## Use ath10k instead ath10k-ct
 CONFIG_PACKAGE_ath10k-firmware-qca9984=y
@@ -163,4 +173,3 @@ CONFIG_IMAGEOPT=y
 CONFIG_VERSIONOPT=y
 CONFIG_VERSION_DIST="OpenWrt NSS"
 # CONFIG_VERSION_FILENAMES is not set
-
