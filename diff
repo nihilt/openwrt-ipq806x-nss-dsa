@@ -157,6 +157,7 @@ CONFIG_PACKAGE_jsonfilter=y
 CONFIG_PACKAGE_libatomic=y
 CONFIG_PACKAGE_htop=y
 CONFIG_PACKAGE_iperf3=y
+CONFIG_PACKAGE_zoneinfo-all=y
 
 ## Storage and file sharing: eSATA, USB, ext4, SMB and NFS
 CONFIG_PACKAGE_kmod-ata-ahci=y
