@@ -25,16 +25,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - device: tplink_c2600
-            seed: diff-c2600
           - device: netgear_r7800
             seed: diff
-          - device: netgear_r7500v2
-            seed: diff-r7500v2
-          # every DSA board that has not been booted yet, one image each
-          - device: dsa-boards
-            seed: diff-dsa-boards
-            images: '*'
 
     steps:
       - name: Free disk space
@@ -52,8 +44,6 @@ jobs:
             python3-setuptools python3-dev rsync swig unzip zlib1g-dev file \
             wget zstd
 
-      # getver.sh counts commits since the OpenWrt "reboot", so the full
-      # history is needed for a correct rXXXXX revision
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -91,8 +81,8 @@ jobs:
       - name: Collect images
         run: |
           mkdir -p out
-          cp bin/targets/ipq806x/generic/openwrt-nss-*-${{ matrix.images || matrix.device }}-* out/
-          cp bin/targets/ipq806x/generic/openwrt-nss-*-${{ matrix.images || matrix.device }}.manifest out/
+          cp bin/targets/ipq806x/generic/openwrt-nss-*-${{ matrix.device }}-* out/
+          cp bin/targets/ipq806x/generic/openwrt-nss-*-${{ matrix.device }}.manifest out/
           (cd out && sha256sum * > sha256sums-${{ matrix.device }})
           ls -la out
 
@@ -124,4 +114,4 @@ jobs:
           gh release create "${{ github.ref_name }}" out/* \
             --repo "${{ github.repository }}" \
             --title "OpenWrt NSS ${{ github.ref_name }}" \
-            --notes "Images for the TP-Link Archer C2600 and the Netgear R7800, built from OpenWrt master. See the README for the test status."
+            --notes "Images for the Netgear R7800, built from OpenWrt master. See the README for the test status."
