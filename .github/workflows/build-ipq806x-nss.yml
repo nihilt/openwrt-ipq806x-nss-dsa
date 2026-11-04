@@ -21,7 +21,6 @@ jobs:
     name: Build ${{ matrix.device }} (${{ matrix.variant }})
     runs-on: ubuntu-24.04
     timeout-minutes: 360
-    # An experimental variant may fail without blocking the release job.
     continue-on-error: ${{ matrix.experimental }}
     env:
       CCACHE_MAXSIZE: 2G
@@ -31,7 +30,7 @@ jobs:
         include:
           - device: netgear_r7800
             variant: std
-            seed: diff
+            seed: diff            # name of the seed file in the repo root
             experimental: false
 
     steps:
@@ -55,16 +54,19 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Cache downloads
-        uses: actions/cache@v4
+      # actions/cache@v4 only saves when the whole job succeeds, so a failed build
+      # lost everything. Restore here, save below with "if: always()".
+      - name: Restore downloads cache
+        id: dl-cache
+        uses: actions/cache/restore@v4
         with:
           path: dl
           key: dl-${{ matrix.device }}-${{ hashFiles('feeds.conf.default', matrix.seed) }}
           restore-keys: dl-${{ matrix.device }}-
 
       # OpenWrt keeps the ccache in ./.ccache when CONFIG_CCACHE_DIR is empty.
-      - name: Cache compiler output (ccache)
-        uses: actions/cache@v4
+      - name: Restore compiler cache (ccache)
+        uses: actions/cache/restore@v4
         with:
           path: .ccache
           key: ccache-${{ matrix.device }}-${{ matrix.variant }}-${{ github.sha }}
@@ -119,12 +121,27 @@ jobs:
             exit 1
           }
 
+      # These run even when the build failed, so the next attempt starts warm.
+      - name: Save downloads cache
+        if: always() && steps.dl-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: dl
+          key: dl-${{ matrix.device }}-${{ hashFiles('feeds.conf.default', matrix.seed) }}
+
+      - name: Save compiler cache (ccache)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ccache-${{ matrix.device }}-${{ matrix.variant }}-${{ github.sha }}
+
       - name: Collect images
         run: |
           mkdir -p out
           cp bin/targets/ipq806x/generic/openwrt-nss-*-${{ matrix.device }}-* out/
           cp bin/targets/ipq806x/generic/openwrt-nss-*-${{ matrix.device }}.manifest out/
-          # Non-std variants get their name in the file names so releases never collide.
+          # Variants other than "std" get their name in the file names so releases never collide.
           if [ "${{ matrix.variant }}" != "std" ]; then
             for f in out/*; do
               mv "$f" "out/$(basename "$f" | sed 's/^openwrt-nss-/openwrt-nss-${{ matrix.variant }}-/')"
