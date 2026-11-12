@@ -115,6 +115,18 @@ host_pkts() {
 		END {print tx + 0, rx + 0}'
 }
 
+# Share of the unicast frames a GMAC received that the firmware forwarded by
+# itself. Broadcast and multicast can never be offloaded, so a WAN segment full
+# of ARP drags the plain share down; the GMAC's unicast MMC counter is the
+# denominator that leaves them out. Pause frames land in its multicast MMC
+# counter but not in rx_packets, so callers take total - unicast for the rest.
+# -> "<unicast_rx_frames> <percent>", or nothing if the driver has no counter
+ucast_rx() {
+	ethtool -S "$1" 2>/dev/null | awk -v off="$2" '
+		$1 == "mmc_rx_ucast_frames:" {u = $2 + 0; have = 1}
+		END {if (have && u > 0) printf "%d %.1f\n", u, (off > u ? 100 : 100 * off / u)}'
+}
+
 # One line per GMAC:
 # ifnum netdev started host_tx host_rx tx_total rx_total crc rx_missed conduit
 #
@@ -187,17 +199,35 @@ flowtables=$(nft list flowtables 2>/dev/null | grep -c '^[[:space:]]*flowtable '
 
 bridge_mgr=$(mod qca_nss_bridge_mgr)
 pppoe_mgr=$(mod qca_nss_pppoe)
+# ipq806x accelerates bridged flows through ECM, not bridge-mgr: ECM only sees a
+# bridged frame in the netfilter hooks when br_netfilter is on (qca-nss-ecm.init
+# sets it, and the module is built in, so it never shows in lsmod). -1 = absent.
+bridge_nf=$(cat "$R/proc/sys/net/bridge/bridge-nf-call-iptables" 2>/dev/null || echo -1)
 
 # There is no ath11k here: the ath10k radios hand their frames to the firmware
 # through NSS virtual interfaces (the Wi-Fi redirect), one per AP/STA netdev.
 # wifi_offload stays -1, as on a qualcommax box without ath11k; the redirect
 # has a key of its own.
 wifi_offload=$(cat "$MOD/ath11k/parameters/nss_offload" 2>/dev/null || echo -1)
-redirect=$(awk '
+# nssifb, the SQM ingress shaper, is an NSS virtual interface too, and it sees
+# every frame that arrives on the shaped port, so it dwarfs the Wi-Fi ones. The
+# stats file has no names: when nssifb exists, the block with the most rx
+# packets is taken for it and left out of the Wi-Fi count.
+ifb=0
+[ -d "$NET/nssifb" ] && ifb=1
+redirect=$(awk -v ifb="$ifb" '
 	/^if_num [0-9]+ stats start:/ {n++}
-	$1 == "tx_packets" {tx += $3}
-	$1 == "rx_packets" {rx += $3}
-	END {print n + 0, tx + 0, rx + 0}' "$DRV/virt_if" 2>/dev/null)
+	$1 == "tx_packets" {tx[n] = $3 + 0}
+	$1 == "rx_packets" {rx[n] = $3 + 0}
+	END {
+		big = 0
+		if (ifb) for (i = 1; i <= n; i++) if (big == 0 || rx[i] > rx[big]) big = i
+		for (i = 1; i <= n; i++) {
+			if (i == big) continue
+			c++; t += tx[i]; r += rx[i]
+		}
+		print c + 0, t + 0, r + 0
+	}' "$DRV/virt_if" 2>/dev/null)
 [ -n "$redirect" ] || redirect="0 0 0"
 set -- $redirect
 redir_if=$1
@@ -255,8 +285,14 @@ koops=$(dmesg 2>/dev/null | grep -cE 'Oops:|BUG:|Kernel panic')
 if [ "$JSON" = 1 ]; then
 	pjson=$(echo "$ports" | while read -r ifn nd st htx hrx ttx trx otx orx ptx prx crc missed cd; do
 		[ -n "$ifn" ] || continue
-		printf '{"ifnum":%s,"netdev":"%s","started":%s,"tx_host_pkts":%s,"rx_host_pkts":%s,"tx_total":%s,"rx_total":%s,"tx_offloaded":%s,"rx_offloaded":%s,"tx_offload_pct":%s,"rx_offload_pct":%s,"conduit":%s,"rx_crc_errors":%s,"rx_missed":%s},' \
-			"$ifn" "$nd" "$st" "$htx" "$hrx" "$ttx" "$trx" "$otx" "$orx" "$ptx" "$prx" "$cd" "$crc" "$missed"
+		ucn=null
+		ucp=null
+		if [ "$cd" = 1 ]; then
+			set -- $(ucast_rx "$nd" "$orx")
+			[ -n "$1" ] && { ucn=$1; ucp=$2; }
+		fi
+		printf '{"ifnum":%s,"netdev":"%s","started":%s,"tx_host_pkts":%s,"rx_host_pkts":%s,"tx_total":%s,"rx_total":%s,"tx_offloaded":%s,"rx_offloaded":%s,"tx_offload_pct":%s,"rx_offload_pct":%s,"rx_unicast_pkts":%s,"rx_unicast_offload_pct":%s,"conduit":%s,"rx_crc_errors":%s,"rx_missed":%s},' \
+			"$ifn" "$nd" "$st" "$htx" "$hrx" "$ttx" "$trx" "$otx" "$orx" "$ptx" "$prx" "$ucn" "$ucp" "$cd" "$crc" "$missed"
 	done)
 	pjson="[${pjson%,}]"
 
@@ -284,7 +320,7 @@ if [ "$JSON" = 1 ]; then
 	"heartbeat_pps":$heartbeat,"cores":$cjson,"ports":$pjson,"dsa_nodes":[],"dsa_ports":$djson,
 	"ecm":{"loaded":$ecm_loaded,"ipv4_accel":$ecm_v4,"ipv6_accel":$ecm_v6,"multicast_accel":$ecm_mc},
 	"flowtables":$flowtables,
-	"modules":{"bridge_mgr":$bridge_mgr,"pppoe":$pppoe_mgr},
+	"modules":{"bridge_mgr":$bridge_mgr,"pppoe":$pppoe_mgr,"bridge_nf":$bridge_nf},
 	"wifi_offload":$wifi_offload,"wifili":[],
 	"wifi_redirect":{"interfaces":$redir_if,"tx_pkts":$redir_tx,"rx_pkts":$redir_rx},
 	"mesh":{"configured":0,"offloaded":0,"fw_capable":0},
@@ -346,6 +382,15 @@ if [ -n "$ports" ]; then
 		printf "    %-6s %3s %3s  %18s %10s  %18s %10s\n" \
 		       "$nd" "$ifn" "$st" "$otx ($ptx%)" "$htx" "$orx ($prx%)" "$hrx"
 	done
+	echo "$ports" | while read -r ifn nd st htx hrx ttx trx otx orx ptx prx crc missed cd; do
+		[ "$cd" = 1 ] || continue
+		set -- $(ucast_rx "$nd" "$orx")
+		[ -n "$1" ] || continue
+		bm=$((trx - $1))
+		[ "$bm" -lt 0 ] && bm=0
+		printf "    %-6s unicast rx offloaded %s%% (%s of %s received frames are broadcast/multicast, which are never offloaded)\n" \
+		       "$nd" "$2" "$bm" "$trx"
+	done
 	echo "    (via host / to host = the host<->firmware exception path, i.e. what was"
 	echo "     NOT offloaded: broadcast/multicast discovery, connection setup and"
 	echo "     short-lived flows, and traffic addressed to the router itself. A quiet"
@@ -353,7 +398,7 @@ if [ -n "$ports" ]; then
 fi
 echo "  switch:      ${tagging:-no DSA conduit}, CRC errors on the GMACs: $crc_total, FCS errors on the switch ports: $fcs_total"
 echo "  ECM:         loaded=$ecm_loaded, accelerated: $ecm_v4 IPv4 / $ecm_v6 IPv6 / $ecm_mc multicast"
-echo "  modules:     bridge-mgr=$bridge_mgr pppoe-mgr=$pppoe_mgr"
+echo "  modules:     bridge-mgr=$bridge_mgr pppoe-mgr=$pppoe_mgr bridge-nf=$bridge_nf (ECM accelerates bridged flows when bridge-nf=1)"
 if [ "$redir_if" -gt 0 ]; then
 	echo "  Wi-Fi:       NSS redirect on $redir_if interfaces ($redir_tx pkts to the firmware, $redir_rx from it)"
 else
