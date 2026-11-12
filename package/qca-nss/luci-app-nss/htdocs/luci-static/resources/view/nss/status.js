@@ -118,7 +118,8 @@ function renderStatus(d) {
 			E('td', { 'class': 'td', 'data-title': _('Started') }, [ p.started ? _('yes') : _('no') ]),
 			E('td', { 'class': 'td', 'data-title': _('TX offloaded') }, [ offl(p.tx_offloaded, p.tx_offload_pct) ]),
 			E('td', { 'class': 'td', 'data-title': _('TX via host') }, [ String(p.tx_host_pkts) ]),
-			E('td', { 'class': 'td', 'data-title': _('RX offloaded') }, [ offl(p.rx_offloaded, p.rx_offload_pct) ]),
+			E('td', { 'class': 'td', 'data-title': _('RX offloaded') }, [ offl(p.rx_offloaded, p.rx_offload_pct) +
+				(p.rx_unicast_offload_pct != null ? ', ' + String(p.rx_unicast_offload_pct) + '% ' + _('of unicast') : '') ]),
 			E('td', { 'class': 'td', 'data-title': _('RX to host') }, [ String(p.rx_host_pkts) ])
 		]);
 	});
@@ -249,7 +250,11 @@ function renderStatus(d) {
 			linkErrors
 				? row(_('Link errors') + (sw.tagging ? ' (' + sw.tagging + ')' : ''), linkErrors)
 				: E('tr', { 'style': 'display:none' }),
-			row(_('Bridge offload (bridge-mgr)'), onoff(d.modules.bridge_mgr)),
+			row(_('Bridged flows (ECM)'), !d.ecm.loaded ? _('ECM not loaded') :
+				d.modules.bridge_nf == 1 ? _('ECM sees bridged frames (bridge-nf on)') :
+				d.modules.bridge_nf == 0 ? _('bridge-nf off: bridged LAN/Wi-Fi traffic is not accelerated') :
+				_('unknown (no bridge-nf sysctl)')),
+			row(_('NSS bridge manager (bridge-mgr, optional)'), onoff(d.modules.bridge_mgr)),
 			row(_('PPPoE manager'), onoff(d.modules.pppoe)),
 			row(_('Wi-Fi data path'), wifi),
 			row(_('SQM shaper'), d.sqm.active
