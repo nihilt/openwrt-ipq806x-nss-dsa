@@ -202,7 +202,10 @@ pppoe_mgr=$(mod qca_nss_pppoe)
 # ipq806x accelerates bridged flows through ECM, not bridge-mgr: ECM only sees a
 # bridged frame in the netfilter hooks when br_netfilter is on (qca-nss-ecm.init
 # sets it, and the module is built in, so it never shows in lsmod). -1 = absent.
+# IPv4 and IPv6 have separate switches; the init script flips both together, so
+# they only differ if someone changed one by hand.
 bridge_nf=$(cat "$R/proc/sys/net/bridge/bridge-nf-call-iptables" 2>/dev/null || echo -1)
+bridge_nf6=$(cat "$R/proc/sys/net/bridge/bridge-nf-call-ip6tables" 2>/dev/null || echo -1)
 
 # There is no ath11k here: the ath10k radios hand their frames to the firmware
 # through NSS virtual interfaces (the Wi-Fi redirect), one per AP/STA netdev.
@@ -320,7 +323,7 @@ if [ "$JSON" = 1 ]; then
 	"heartbeat_pps":$heartbeat,"cores":$cjson,"ports":$pjson,"dsa_nodes":[],"dsa_ports":$djson,
 	"ecm":{"loaded":$ecm_loaded,"ipv4_accel":$ecm_v4,"ipv6_accel":$ecm_v6,"multicast_accel":$ecm_mc},
 	"flowtables":$flowtables,
-	"modules":{"bridge_mgr":$bridge_mgr,"pppoe":$pppoe_mgr,"bridge_nf":$bridge_nf},
+	"modules":{"bridge_mgr":$bridge_mgr,"pppoe":$pppoe_mgr,"bridge_nf":$bridge_nf,"bridge_nf6":$bridge_nf6},
 	"wifi_offload":$wifi_offload,"wifili":[],
 	"wifi_redirect":{"interfaces":$redir_if,"tx_pkts":$redir_tx,"rx_pkts":$redir_rx},
 	"mesh":{"configured":0,"offloaded":0,"fw_capable":0},
@@ -398,7 +401,7 @@ if [ -n "$ports" ]; then
 fi
 echo "  switch:      ${tagging:-no DSA conduit}, CRC errors on the GMACs: $crc_total, FCS errors on the switch ports: $fcs_total"
 echo "  ECM:         loaded=$ecm_loaded, accelerated: $ecm_v4 IPv4 / $ecm_v6 IPv6 / $ecm_mc multicast"
-echo "  modules:     bridge-mgr=$bridge_mgr pppoe-mgr=$pppoe_mgr bridge-nf=$bridge_nf (ECM accelerates bridged flows when bridge-nf=1)"
+echo "  modules:     bridge-mgr=$bridge_mgr pppoe-mgr=$pppoe_mgr bridge-nf=$bridge_nf bridge-nf6=$bridge_nf6 (ECM accelerates bridged IPv4/IPv6 flows when the matching value is 1)"
 if [ "$redir_if" -gt 0 ]; then
 	echo "  Wi-Fi:       NSS redirect on $redir_if interfaces ($redir_tx pkts to the firmware, $redir_rx from it)"
 else

@@ -79,6 +79,23 @@ function offl(pkts, pct) {
 	return String(pkts) + ' (' + pct + '%)';
 }
 
+// ECM only sees bridged frames while the matching br_netfilter switch is on:
+// bridge-nf-call-iptables for IPv4, bridge-nf-call-ip6tables for IPv6 (-1 =
+// sysctl absent). An older nss-status without bridge_nf6 reads as IPv4 only.
+function bridgeNfText(m) {
+	var v4 = m.bridge_nf, v6 = (m.bridge_nf6 == null) ? -1 : m.bridge_nf6;
+
+	if (v4 == 1 && v6 == 0)
+		return _('IPv4 only: bridge-nf-call-ip6tables is off, bridged IPv6 is not accelerated');
+	if (v4 == 0 && v6 == 1)
+		return _('IPv6 only: bridge-nf-call-iptables is off, bridged IPv4 is not accelerated');
+	if (v4 == 1)
+		return _('ECM sees bridged frames (bridge-nf on)');
+	if (v4 == 0)
+		return _('bridge-nf off: bridged LAN/Wi-Fi traffic is not accelerated');
+	return _('unknown (no bridge-nf sysctl)');
+}
+
 function renderStatus(d) {
 	var cores = (d.cores || []).map(function(c) {
 		return 'core' + c.core + ' ' + c.avg + '%';
@@ -250,11 +267,8 @@ function renderStatus(d) {
 			linkErrors
 				? row(_('Link errors') + (sw.tagging ? ' (' + sw.tagging + ')' : ''), linkErrors)
 				: E('tr', { 'style': 'display:none' }),
-			row(_('Bridged flows (ECM)'), !d.ecm.loaded ? _('ECM not loaded') :
-				d.modules.bridge_nf == 1 ? _('ECM sees bridged frames (bridge-nf on)') :
-				d.modules.bridge_nf == 0 ? _('bridge-nf off: bridged LAN/Wi-Fi traffic is not accelerated') :
-				_('unknown (no bridge-nf sysctl)')),
-			row(_('NSS bridge manager (bridge-mgr, optional)'), onoff(d.modules.bridge_mgr)),
+			row(_('Bridged flows (ECM)'), !d.ecm.loaded ? _('ECM not loaded') : bridgeNfText(d.modules)),
+			row(_('NSS bridge manager (bridge-mgr, not used on this build)'), onoff(d.modules.bridge_mgr)),
 			row(_('PPPoE manager'), onoff(d.modules.pppoe)),
 			row(_('Wi-Fi data path'), wifi),
 			row(_('SQM shaper'), d.sqm.active
