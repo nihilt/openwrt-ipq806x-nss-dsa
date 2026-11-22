@@ -18,23 +18,20 @@ concurrency:
 
 jobs:
   build:
-    name: Build ${{ matrix.device }}
+    name: Build ${{ matrix.device }} (${{ matrix.variant }})
     runs-on: ubuntu-24.04
     timeout-minutes: 360
+    continue-on-error: ${{ matrix.experimental }}
+    env:
+      CCACHE_MAXSIZE: 2G
     strategy:
       fail-fast: false
       matrix:
         include:
-          - device: tplink_c2600
-            seed: diff-c2600
           - device: netgear_r7800
-            seed: diff
-          - device: netgear_r7500v2
-            seed: diff-r7500v2
-          # every DSA board that has not been booted yet, one image each
-          - device: dsa-boards
-            seed: diff-dsa-boards
-            images: '*'
+            variant: std
+            seed: diff            # name of the seed file in the repo root
+            experimental: false
 
     steps:
       - name: Free disk space
@@ -52,19 +49,29 @@ jobs:
             python3-setuptools python3-dev rsync swig unzip zlib1g-dev file \
             wget zstd
 
-      # getver.sh counts commits since the OpenWrt "reboot", so the full
-      # history is needed for a correct rXXXXX revision
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
-      - name: Cache downloads
-        uses: actions/cache@v4
+      # actions/cache only saves when the whole job succeeds, so a failed build
+      # lost everything. Restore here, save below with "if: always()".
+      - name: Restore downloads cache
+        id: dl-cache
+        uses: actions/cache/restore@v5
         with:
           path: dl
           key: dl-${{ matrix.device }}-${{ hashFiles('feeds.conf.default', matrix.seed) }}
           restore-keys: dl-${{ matrix.device }}-
+
+      # OpenWrt keeps the ccache in ./.ccache when CONFIG_CCACHE_DIR is empty.
+      - name: Restore compiler cache (ccache)
+        uses: actions/cache/restore@v5
+        with:
+          path: .ccache
+          key: ccache-${{ matrix.device }}-${{ matrix.variant }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ matrix.device }}-${{ matrix.variant }}-
 
       - name: Update feeds
         run: |
@@ -75,7 +82,33 @@ jobs:
       - name: Configure
         run: |
           cp ${{ matrix.seed }} .config
+          # ccache is enabled for CI only, so local builds of the seed are unaffected
+          echo 'CONFIG_CCACHE=y' >> .config
           make defconfig
+
+      # Warn about seed lines that "make defconfig" silently dropped (renamed or
+      # removed packages, unmet dependencies). Checked before the long build.
+      - name: Check seed survived defconfig
+        run: |
+          grep '^CONFIG_' "${{ matrix.seed }}" | sed 's/[[:space:]]*$//' > seed.lines
+          : > dropped.txt
+          while IFS= read -r line; do
+            grep -qxF -- "$line" .config || echo "$line" >> dropped.txt
+          done < seed.lines
+          if [ -s dropped.txt ]; then
+            while IFS= read -r line; do
+              echo "::warning::dropped by defconfig: $line"
+            done < dropped.txt
+            {
+              echo "### Seed lines dropped by defconfig (${{ matrix.variant }})"
+              echo '```'
+              cat dropped.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "All seed lines survived defconfig."
+          fi
+          rm -f seed.lines dropped.txt
 
       - name: Download sources
         run: make -j8 download
@@ -88,18 +121,51 @@ jobs:
             exit 1
           }
 
+      # These run even when the build failed, so the next attempt starts warm.
+      - name: Save downloads cache
+        if: always() && steps.dl-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: dl
+          key: dl-${{ matrix.device }}-${{ hashFiles('feeds.conf.default', matrix.seed) }}
+
+      # On a cancelled run make/ccache are still writing to .ccache when the save
+      # step starts, so tar fails with "file changed as we read it" and the cache
+      # is lost. Stop make and wait (up to 60 s) for running ccache jobs to finish.
+      - name: Stop leftover build processes
+        if: always()
+        run: |
+          pkill -TERM -x make || true
+          for i in $(seq 1 30); do
+            pgrep -x ccache >/dev/null || break
+            sleep 2
+          done
+
+      - name: Save compiler cache (ccache)
+        if: always()
+        uses: actions/cache/save@v5
+        with:
+          path: .ccache
+          key: ccache-${{ matrix.device }}-${{ matrix.variant }}-${{ github.sha }}
+
       - name: Collect images
         run: |
           mkdir -p out
-          cp bin/targets/ipq806x/generic/openwrt-nss-*-${{ matrix.images || matrix.device }}-* out/
-          cp bin/targets/ipq806x/generic/openwrt-nss-*-${{ matrix.images || matrix.device }}.manifest out/
-          (cd out && sha256sum * > sha256sums-${{ matrix.device }})
+          cp bin/targets/ipq806x/generic/openwrt-nss-*-${{ matrix.device }}-* out/
+          cp bin/targets/ipq806x/generic/openwrt-nss-*-${{ matrix.device }}.manifest out/
+          # Variants other than "std" get their name in the file names so releases never collide.
+          if [ "${{ matrix.variant }}" != "std" ]; then
+            for f in out/*; do
+              mv "$f" "out/$(basename "$f" | sed 's/^openwrt-nss-/openwrt-nss-${{ matrix.variant }}-/')"
+            done
+          fi
+          (cd out && sha256sum * > sha256sums-${{ matrix.device }}-${{ matrix.variant }})
           ls -la out
 
       - name: Upload images
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
-          name: openwrt-nss-${{ matrix.device }}
+          name: openwrt-nss-${{ matrix.device }}-${{ matrix.variant }}
           path: out/
           retention-days: 30
 
@@ -112,7 +178,7 @@ jobs:
       contents: write
     steps:
       - name: Download images
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           path: out
           merge-multiple: true
@@ -124,4 +190,4 @@ jobs:
           gh release create "${{ github.ref_name }}" out/* \
             --repo "${{ github.repository }}" \
             --title "OpenWrt NSS ${{ github.ref_name }}" \
-            --notes "Images for the TP-Link Archer C2600 and the Netgear R7800, built from OpenWrt master. See the README for the test status."
+            --notes "Images for the Netgear R7800, built from OpenWrt master. See the README for the test status."
