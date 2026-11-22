@@ -1,12 +1,12 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=sqm-autorate-nss
-PKG_VERSION:=20261101
+PKG_VERSION:=20261120
 PKG_RELEASE:=1
 
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_URL:=https://github.com/nihilt/sqm-autorate-nss.git
-PKG_SOURCE_VERSION:=d6397b3e1e0451bff3fd1c3ededd3eb1e63b8f08
+PKG_SOURCE_VERSION:=dbb10651708fc6af93b31f0dced440827f0b46f6
 PKG_MIRROR_HASH:=skip
 
 PKG_LICENSE:=GPL-3.0-only
