@@ -704,10 +704,11 @@ Signed-off-by: Pavithra R <quic_pavir@quicinc.com>
  };
  
  #define bond_slave_get_rcu(dev) \
-@@ -712,6 +715,11 @@ struct bond_vlan_tag *bond_verify_device
+@@ -712,7 +715,12 @@ struct bond_vlan_tag *bond_verify_device
  					      int level);
  int bond_update_slave_arr(struct bonding *bond, struct slave *skipslave);
  void bond_slave_arr_work_rearm(struct bonding *bond, unsigned long delay);
+ void bond_peer_notify_work_rearm(struct bonding *bond, unsigned long delay);
 +uint32_t bond_xmit_hash_without_skb(uint8_t *src_mac, uint8_t *dst_mac,
 +				    void *psrc, void *pdst, uint16_t protocol,
 +				    struct net_device *bond_dev,
