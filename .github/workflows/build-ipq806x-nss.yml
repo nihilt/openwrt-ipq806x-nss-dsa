@@ -110,6 +110,12 @@ jobs:
           fi
           rm -f seed.lines dropped.txt
 
+      # sqm-scripts-nss and sqm-autorate-nss are pinned by commit and use
+      # PKG_MIRROR_HASH:=skip, so a cached tarball with the same name would hide
+      # a new PKG_SOURCE_VERSION.
+      - name: Drop cached sources of the NSS SQM packages
+        run: rm -f dl/sqm-scripts-nss-*.tar.* dl/sqm-autorate-nss-*.tar.*
+
       - name: Download sources
         run: make -j8 download
 
