@@ -30,7 +30,7 @@ jobs:
         include:
           - device: netgear_r7800
             variant: std
-            seed: diff            # name of the seed file in the repo root
+            seed: diff
             experimental: false
 
     steps:
@@ -126,6 +126,32 @@ jobs:
             make -j1 V=s 2>&1 | tail -n 300
             exit 1
           }
+
+      # Print the actual kernel header and reject file when the bonding patch fails.
+      - name: Diagnose bonding patch failure
+        if: failure()
+        run: |
+          KDIR=$(find build_dir -path '*/linux-6.18.64/include/net/bonding.h' -print -quit)
+
+          if [ -z "$KDIR" ]; then
+            echo "::warning::Could not locate the Linux 6.18.64 bonding.h"
+            find build_dir -name bonding.h -print
+            exit 0
+          fi
+
+          echo "Kernel header: $KDIR"
+          echo "----- bonding.h lines 700-735 -----"
+          sed -n '700,735p' "$KDIR"
+
+          echo "----- bonding.h.rej -----"
+          if [ -f "${KDIR}.rej" ]; then
+            cat "${KDIR}.rej"
+          else
+            echo "No reject file found at ${KDIR}.rej"
+          fi
+
+          echo "----- Relevant declarations -----"
+          grep -n -E 'bond_update_slave_arr|bond_slave_arr_work_rearm|bond_xmit_hash_without_skb|bond_work_init_all' "$KDIR" || true
 
       # These run even when the build failed, so the next attempt starts warm.
       - name: Save downloads cache
