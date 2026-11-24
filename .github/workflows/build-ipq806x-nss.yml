@@ -18,23 +18,20 @@ concurrency:
 
 jobs:
   build:
-    name: Build ${{ matrix.device }}
+    name: Build ${{ matrix.device }} (${{ matrix.variant }})
     runs-on: ubuntu-24.04
     timeout-minutes: 360
+    continue-on-error: ${{ matrix.experimental }}
+    env:
+      CCACHE_MAXSIZE: 2G
     strategy:
       fail-fast: false
       matrix:
         include:
-          - device: tplink_c2600
-            seed: diff-c2600
           - device: netgear_r7800
+            variant: std
             seed: diff
-          - device: netgear_r7500v2
-            seed: diff-r7500v2
-          # every DSA board that has not been booted yet, one image each
-          - device: dsa-boards
-            seed: diff-dsa-boards
-            images: '*'
+            experimental: false
 
     steps:
       - name: Free disk space
@@ -52,19 +49,29 @@ jobs:
             python3-setuptools python3-dev rsync swig unzip zlib1g-dev file \
             wget zstd
 
-      # getver.sh counts commits since the OpenWrt "reboot", so the full
-      # history is needed for a correct rXXXXX revision
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
-      - name: Cache downloads
-        uses: actions/cache@v4
+      # actions/cache only saves when the whole job succeeds, so a failed build
+      # lost everything. Restore here, save below with "if: always()".
+      - name: Restore downloads cache
+        id: dl-cache
+        uses: actions/cache/restore@v5
         with:
           path: dl
           key: dl-${{ matrix.device }}-${{ hashFiles('feeds.conf.default', matrix.seed) }}
           restore-keys: dl-${{ matrix.device }}-
+
+      # OpenWrt keeps the ccache in ./.ccache when CONFIG_CCACHE_DIR is empty.
+      - name: Restore compiler cache (ccache)
+        uses: actions/cache/restore@v5
+        with:
+          path: .ccache
+          key: ccache-${{ matrix.device }}-${{ matrix.variant }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ matrix.device }}-${{ matrix.variant }}-
 
       - name: Update feeds
         run: |
@@ -75,31 +82,388 @@ jobs:
       - name: Configure
         run: |
           cp ${{ matrix.seed }} .config
+          # ccache is enabled for CI only, so local builds of the seed are unaffected
+          echo 'CONFIG_CCACHE=y' >> .config
           make defconfig
 
-      - name: Download sources
-        run: make -j8 download
+      # Warn about seed lines that "make defconfig" silently dropped (renamed or
+      # removed packages, unmet dependencies). Checked before the long build.
+      - name: Check seed survived defconfig
+        run: |
+          grep '^CONFIG_' "${{ matrix.seed }}" | sed 's/[[:space:]]*$//' > seed.lines
+          : > dropped.txt
+          while IFS= read -r line; do
+            grep -qxF -- "$line" .config || echo "$line" >> dropped.txt
+          done < seed.lines
+          if [ -s dropped.txt ]; then
+            while IFS= read -r line; do
+              echo "::warning::dropped by defconfig: $line"
+            done < dropped.txt
+            {
+              echo "### Seed lines dropped by defconfig (${{ matrix.variant }})"
+              echo '```'
+              cat dropped.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "All seed lines survived defconfig."
+          fi
+          rm -f seed.lines dropped.txt
 
+      # sqm-scripts-nss and sqm-autorate-nss are pinned by commit and use
+      # PKG_MIRROR_HASH:=skip, so a cached tarball with the same name would hide
+      # a new PKG_SOURCE_VERSION.
+      - name: Drop cached sources of the NSS SQM packages
+        run: rm -f dl/sqm-scripts-nss-*.tar.* dl/sqm-autorate-nss-*.tar.*
+
+      - name: Download sources
+        run: |
+          set -o pipefail
+          mkdir -p ci-logs
+          make -j8 download 2>&1 | tee ci-logs/download.log
+
+      # Both runs are logged to ci-logs/ for the diagnosis step below. The -j1
+      # V=s rerun only redoes what failed and shows the real error first; if it
+      # passes, the parallel failure was a race and the job carries on.
       - name: Build
         run: |
-          make -j$(nproc) || {
-            echo "::warning::parallel build failed, rerunning with -j1 V=s"
-            make -j1 V=s 2>&1 | tail -n 300
-            exit 1
-          }
+          set -o pipefail
+          mkdir -p ci-logs
+          if make -j"$(nproc)" 2>&1 | tee ci-logs/build-parallel.log; then
+            exit 0
+          fi
+          echo "::warning::parallel build failed, rerunning with -j1 V=s"
+          if make -j1 V=s 2>&1 | tee ci-logs/build-j1.log | tail -n 200; then
+            mv ci-logs/build-j1.log ci-logs/build-j1-passed.log
+            echo "::warning::the -j1 rerun passed, so the parallel failure was a race"
+            exit 0
+          fi
+          exit 1
+
+      # Runs after any failed step and reads ci-logs/. Prints collapsible groups
+      # and a job summary: failing stage and package, the first error with its
+      # context, rejected patch hunks next to the current file contents, compiler
+      # errors with the source line and the kernel's own struct or declaration,
+      # unresolved module symbols, hash mismatches, kernel config symbols and
+      # memory or disk trouble.
+      - name: Diagnose build failure
+        if: failure()
+        continue-on-error: true
+        timeout-minutes: 15
+        run: |
+          set +e
+          LOGDIR=ci-logs
+          SUM="${GITHUB_STEP_SUMMARY:-/dev/null}"
+          mkdir -p diag
+
+          out()  { tee -a "$SUM"; }
+          sect() { echo "::group::$1"; printf '\n#### %s\n```\n' "$1" >> "$SUM"; }
+          endsect() { echo '```' >> "$SUM"; echo "::endgroup::"; }
+          # Lines A..B of a file, with real line numbers.
+          win()  { awk -v a="$2" -v b="$3" 'NR>=a && NR<=b { printf "%6d  %s\n", NR, substr($0,1,200) }' "$1"; }
+          clamp() { [ "$1" -lt 1 ] && echo 1 || echo "$1"; }
+
+          # Prefer the verbose -j1 rerun (its first error is the root cause), then the
+          # parallel run, then the download log.
+          LOG=""
+          for f in "$LOGDIR/build-j1.log" "$LOGDIR/build-parallel.log" "$LOGDIR/download.log"; do
+            if [ -s "$f" ]; then LOG="$f"; break; fi
+          done
+          if [ -z "$LOG" ]; then
+            echo "No download or build log: a step before the download failed, nothing to analyse."
+            printf '### Build failure\n\nA step before the download failed, so there is no build log.\n' >> "$SUM"
+            exit 0
+          fi
+          TOTAL=$(wc -l < "$LOG")
+          echo "Analysing $LOG ($TOTAL lines)"
+
+          # Most specific first. With V=s the compile lines carry -Werror=... flags, so
+          # a bare "error" is not used.
+          P_ROOT=': (fatal )?error:|error\[E[0-9]+\]|ERROR: modpost|Hunk #[0-9]+ FAILED|Patch failed|can.t find file to patch|undefined reference to|cannot find -l|collect2: error|internal compiler error|signal terminated program|No rule to make target|Hash mismatch|Hash of the downloaded file|No more mirrors|unmet direct dependencies|\(NEW\)|Traceback \(most recent'
+          P_PATCH='Hunk #[0-9]+ FAILED|Patch failed|can.t find file to patch'
+          P_MAKE='make\[[0-9]+\]: \*\*\* '
+
+          if [ "$LOG" = "$LOGDIR/download.log" ]; then
+            first=$(grep -nE 'No more mirrors|Hash mismatch|Hash of the downloaded file' "$LOG" | tail -n1 | cut -d: -f1)
+          fi
+          [ -n "$first" ] || first=$(grep -nE "$P_ROOT" "$LOG" | head -n1 | cut -d: -f1)
+          [ -n "$first" ] || first=$(grep -nE "$P_MAKE" "$LOG" | head -n1 | cut -d: -f1)
+          [ -n "$first" ] || first=$TOTAL
+
+          tgts=$(sed -nE 's/.*\*\*\* \[[^]]*: ([^]]+)\] Error.*/\1/p' "$LOG" | awk '!s[$0]++' | head -n 4)
+          pkgs=$(grep -oE 'ERROR: [^ ]+ failed to build' "$LOG" | sed -E 's/^ERROR: //; s/ failed to build$//' | awk '!s[$0]++' | head -n 5)
+          dir=$(head -n "$first" "$LOG" | grep 'Entering directory' | tail -n1 | sed -E "s/.*Entering directory '([^']*)'.*/\1/")
+          t1=$(printf '%s\n' "$tgts" | head -n1)
+          # The innermost make target is often a single object file; the outer ones name the stage.
+          stage=""
+          for t in $tgts; do
+            case "$t" in
+              *.prepared*|*/prepare|*/prepare-*)       stage="prepare (unpack and patch)" ;;
+              *.configured*|*/configure)               stage="configure" ;;
+              *.built*|*/compile|*/compile-*)          stage="compile" ;;
+              *.install*|*/install|*/ipkg-*|*/apk-*)   stage="install or package" ;;
+              *download*)                              stage="download" ;;
+            esac
+            [ -n "$stage" ] && break
+          done
+          grep -qE "$P_PATCH" "$LOG" && stage="patching"
+          [ "$LOG" = "$LOGDIR/download.log" ] && stage="download"
+
+          KSRC=$(ls -d build_dir/target-*/linux-*/linux-[0-9]* 2>/dev/null | head -n1)
+
+          sect "Summary"
+          {
+            echo "log:       $LOG"
+            echo "stage:     ${stage:-unknown}"
+            echo "package:   ${pkgs:-unknown}"
+            echo "make:      ${t1:-none}"
+            echo "directory: ${dir:-unknown}"
+            echo "first error (line $first):"
+            sed -n "${first}p" "$LOG" | cut -c1-300
+          } | out
+          endsect
+
+          sect "Log around the first error"
+          win "$LOG" "$(clamp $((first-30)))" $((first+12)) | out
+          endsect
+
+          sect "Distinct error lines"
+          { grep -E "$P_ROOT" "$LOG" | cut -c1-250 | awk '!s[$0]++' | head -n 30; } | out
+          endsect
+
+          # ---------------------------------------------------------------- patches
+          if grep -qE "$P_PATCH" "$LOG"; then
+            sect "Patch failure"
+            fl=$(grep -nE "$P_PATCH" "$LOG" | head -n1 | cut -d: -f1)
+            {
+              pl=$(head -n "$fl" "$LOG" | grep -E 'Applying .* using' | tail -n1)
+              pf=$(printf '%s' "$pl" | sed -nE 's/^Applying (.*) using .*/\1/p')
+              [ -n "$pf" ] || pf=$(grep -m1 -oE 'Please fix [^ ]+!' "$LOG" | sed -E 's/^Please fix //; s/!$//')
+              echo "failing patch: ${pf:-unknown}"
+              if [ -n "$pf" ] && [ -f "$pf" ]; then
+                echo "last commits touching it:"
+                git log -n 3 --format='  %h %ad %s' --date=short -- "$pf" 2>/dev/null
+              fi
+              echo "patch messages:"
+              head -n "$((fl+6))" "$LOG" | grep -E 'patching file|Hunk #|FAILED|Applying|Patch failed|can.t find file' | tail -n 12
+            } | out
+
+            find build_dir -name '*.rej' -type f 2>/dev/null | head -n 8 > diag/rej.list
+            while IFS= read -r rej; do
+              tgt=${rej%.rej}
+              {
+                echo
+                echo "---- rejected hunks: $rej"
+                head -n 60 "$rej"
+                grep -E '^@@ -[0-9]+' "$rej" | head -n 3 | while read -r h; do
+                  s=$(printf '%s' "$h" | sed -E 's/^@@ -([0-9]+).*/\1/')
+                  l=$(printf '%s' "$h" | sed -E 's/^@@ -[0-9]+,?([0-9]*) .*/\1/')
+                  l=${l:-1}
+                  a=$(clamp $((s-10))); b=$((s+l+15))
+                  echo
+                  echo "---- $tgt as it is now, lines $a-$b (hunk expected it near line $s)"
+                  win "$tgt" "$a" "$b"
+                done
+                # Identifiers the hunk expects (removed and context lines): do they still exist?
+                echo
+                echo "---- identifiers from the hunk, looked up in $tgt"
+                grep -vE '^(\+|@@|\*\*\*|---)' "$rej" \
+                  | grep -oE '[A-Za-z_][A-Za-z0-9_]{5,}' | awk '!s[$0]++' \
+                  | grep -vxE 'return|static|struct|unsigned|inline|const|void|extern|typedef|sizeof|define|include|ifdef|endif|else|while|break|continue|switch|default|volatile|signed|short|double|float' \
+                  | head -n 20 | while read -r id; do
+                      m=$(grep -nwm1 "$id" "$tgt" 2>/dev/null | head -n1 | cut -c1-110)
+                      if [ -n "$m" ]; then echo "  present   $id  ->  $m"; else echo "  MISSING   $id"; fi
+                    done
+              } | out
+            done < diag/rej.list
+            [ -s diag/rej.list ] || echo "no .rej files under build_dir (the patch did not apply at all, e.g. file not found)" | out
+            endsect
+          fi
+
+          # ------------------------------------------------------- compile errors
+          ce=$(grep -nE ': (fatal )?error:' "$LOG" | head -n1)
+          if [ -n "$ce" ]; then
+            sect "First compiler error"
+            ln=${ce%%:*}; line=${ce#*:}
+            src=$(printf '%s' "$line" | sed -nE 's/^([^: ]+):([0-9]+):.*/\1/p')
+            sln=$(printf '%s' "$line" | sed -nE 's/^([^: ]+):([0-9]+):.*/\2/p')
+            msg=$(printf '%s' "$line" | sed -E 's/^[^:]+:[0-9]+:([0-9]+:)? *//')
+            cdir=$(head -n "$ln" "$LOG" | grep 'Entering directory' | tail -n1 | sed -E "s/.*Entering directory '([^']*)'.*/\1/")
+            {
+              echo "$line" | cut -c1-300
+              f=""
+              if [ -n "$src" ]; then
+                for c in "$src" "$cdir/$src"; do [ -f "$c" ] && { f=$c; break; }; done
+                if [ -z "$f" ]; then
+                  rel=$(printf '%s' "$src" | sed -E 's#^(\.\./|\./)+##')
+                  f=$(find build_dir -path "*/$rel" -type f -print -quit 2>/dev/null)
+                fi
+              fi
+              if [ -n "$f" ] && [ -n "$sln" ]; then
+                echo; echo "---- $f around line $sln"
+                win "$f" "$(clamp $((sln-7)))" $((sln+7))
+              fi
+
+              syms=$(printf '%s\n' "$msg" | grep -oE "(‘|'|\`)[A-Za-z_][A-Za-z0-9_]*(’|')" | sed -E "s/^(‘|'|\`)//; s/(’|')\$//" | awk '!s[$0]++' | head -n 3)
+              case "$msg" in
+                *"has no member named"*)
+                  st=$(printf '%s' "$msg" | sed -nE 's/.*struct ([A-Za-z0-9_]+).*/\1/p' | head -n1)
+                  d=""
+                  [ -n "$st" ] && [ -n "$KSRC" ] && d=$(grep -rnE "^struct $st \{" "$KSRC/include" "$KSRC/net" "$KSRC/drivers/net" --include='*.h' 2>/dev/null | head -n1)
+                  if [ -n "$d" ]; then
+                    df=$(printf '%s' "$d" | cut -d: -f1); dl=$(printf '%s' "$d" | cut -d: -f2)
+                    echo; echo "---- struct $st as defined in this kernel ($df:$dl)"
+                    awk -v a="$dl" 'NR>=a { printf "%6d  %s\n", NR, substr($0,1,160); if ($0 ~ /^};/) exit }' "$df" | head -n 90
+                  else
+                    echo; echo "(struct definition not found in the kernel include, net or drivers/net trees)"
+                  fi ;;
+                *"No such file or directory"*)
+                  hdr=$(printf '%s' "$msg" | sed -nE 's/.*error: ([^ :]+): No such file.*/\1/p')
+                  echo; echo "---- header $hdr elsewhere in the trees"
+                  [ -n "$hdr" ] && find build_dir staging_dir -name "$(basename "$hdr")" -print 2>/dev/null | head -n 8 ;;
+                *)
+                  if [ -n "$KSRC" ] && [ -n "$syms" ]; then
+                    for s in $syms; do
+                      echo; echo "---- '$s' in $KSRC/include"
+                      r=$(grep -rnw -- "$s" "$KSRC/include" --include='*.h' 2>/dev/null | head -n 6 | cut -c1-200)
+                      [ -n "$r" ] && echo "$r" || echo "  not in this kernel's headers: removed, renamed, or defined by the package itself"
+                    done
+                  fi ;;
+              esac
+            } | out
+            endsect
+          fi
+
+          if grep -q 'ERROR: modpost' "$LOG"; then
+            sect "Kernel module symbols that do not resolve"
+            {
+              grep 'ERROR: modpost' "$LOG" | cut -c1-220 | awk '!s[$0]++' | head -n 12
+              for s in $(sed -nE 's/.*modpost: "([^"]+)".*/\1/p' "$LOG" | awk '!s[$0]++' | head -n 5); do
+                echo; echo "---- is $s exported by this kernel?"
+                if [ -n "$KSRC" ]; then
+                  r=$(timeout 90 grep -rnE "EXPORT_SYMBOL[A-Z_]*\($s[,)]" "$KSRC" --include='*.c' 2>/dev/null | head -n 3 | cut -c1-200)
+                  [ -n "$r" ] && echo "$r" || echo "  no EXPORT_SYMBOL for it: removed, renamed or GPL-only in $(basename "$KSRC")"
+                fi
+              done
+            } | out
+            endsect
+          fi
+
+          # ------------------------------------------------------ other categories
+          if grep -qE 'Hash mismatch|Hash of the downloaded file|No more mirrors' "$LOG"; then
+            sect "Download or hash problem"
+            {
+              grep -E 'Hash mismatch|Hash of the downloaded file|No more mirrors' "$LOG" | cut -c1-300 | awk '!s[$0]++' | head -n 10
+              echo
+              echo "A new PKG_SOURCE_VERSION needs a matching PKG_MIRROR_HASH (or PKG_MIRROR_HASH:=skip); a changed PKG_HASH needs the new sha256."
+            } | out
+            endsect
+          fi
+
+          if grep -qE '\(NEW\)|unmet direct dependencies' "$LOG"; then
+            sect "Kernel config symbols"
+            {
+              grep -E '\(NEW\)|unmet direct dependencies' "$LOG" | cut -c1-200 | awk '!s[$0]++' | head -n 20
+              echo
+              echo "Set each missing symbol (y, m or n) in $(ls target/linux/ipq806x/config-* 2>/dev/null | tail -n1)."
+            } | out
+            endsect
+          fi
+
+          if grep -qE 'signal terminated program|internal compiler error|virtual memory exhausted|No space left on device|Killed$' "$LOG"; then
+            sect "Resource problem"
+            {
+              grep -E 'signal terminated program|internal compiler error|virtual memory exhausted|No space left on device|Killed$' "$LOG" | head -n 5 | cut -c1-200
+              df -h / | tail -n2; free -m | sed -n 1,2p
+              echo "Out of memory or disk: try a lower -j, or rerun the job."
+            } | out
+            endsect
+          fi
+
+          # ------------------------------------------------------------ environment
+          sect "Environment"
+          {
+            echo "commit: $(git log -1 --format='%h %s' 2>/dev/null)"
+            echo "kernel build dir: ${KSRC:-none}"
+            kf=$(ls include/kernel-[0-9]* 2>/dev/null | tail -n1)
+            [ -n "$kf" ] && grep -hE '^LINUX_VERSION-' "$kf"
+            g=$(ls staging_dir/toolchain-*/bin/*-gcc 2>/dev/null | head -n1)
+            [ -n "$g" ] && "$g" --version 2>/dev/null | head -n1
+            df -h / | tail -n1
+            free -m | sed -n 2p
+          } | out
+          endsect
+
+          # ------------------------------------------------------------- artefacts
+          cp .config diag/dot-config 2>/dev/null
+          [ -n "$KSRC" ] && cp "$KSRC/.config" diag/kernel-dot-config 2>/dev/null
+          find build_dir -name '*.rej' -type f 2>/dev/null | head -n 50 | while read -r r; do
+            mkdir -p "diag/rej/$(dirname "$r")" && cp "$r" "diag/rej/$r"
+          done
+          if [ -n "$dir" ] && [ -d "$dir" ]; then
+            find "$dir" -maxdepth 3 \( -name config.log -o -name CMakeError.log -o -name CMakeOutput.log \) -print 2>/dev/null | head -n 6 | while read -r c; do
+              cp --parents "$c" diag/ 2>/dev/null
+            done
+          fi
+          echo "Logs and diagnostics are uploaded as the artifact build-failure-*."
+          exit 0
+
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: build-failure-${{ matrix.device }}-${{ matrix.variant }}
+          path: |
+            ci-logs/
+            diag/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # These run even when the build failed, so the next attempt starts warm.
+      - name: Save downloads cache
+        if: always() && steps.dl-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: dl
+          key: dl-${{ matrix.device }}-${{ hashFiles('feeds.conf.default', matrix.seed) }}
+
+      # On a cancelled run make/ccache are still writing to .ccache when the save
+      # step starts, so tar fails with "file changed as we read it" and the cache
+      # is lost. Stop make and wait (up to 60 s) for running ccache jobs to finish.
+      - name: Stop leftover build processes
+        if: always()
+        run: |
+          pkill -TERM -x make || true
+          for i in $(seq 1 30); do
+            pgrep -x ccache >/dev/null || break
+            sleep 2
+          done
+
+      - name: Save compiler cache (ccache)
+        if: always()
+        uses: actions/cache/save@v5
+        with:
+          path: .ccache
+          key: ccache-${{ matrix.device }}-${{ matrix.variant }}-${{ github.sha }}
 
       - name: Collect images
         run: |
           mkdir -p out
-          cp bin/targets/ipq806x/generic/openwrt-nss-*-${{ matrix.images || matrix.device }}-* out/
-          cp bin/targets/ipq806x/generic/openwrt-nss-*-${{ matrix.images || matrix.device }}.manifest out/
-          (cd out && sha256sum * > sha256sums-${{ matrix.device }})
+          cp bin/targets/ipq806x/generic/openwrt-nss-*-${{ matrix.device }}-* out/
+          cp bin/targets/ipq806x/generic/openwrt-nss-*-${{ matrix.device }}.manifest out/
+          # Variants other than "std" get their name in the file names so releases never collide.
+          if [ "${{ matrix.variant }}" != "std" ]; then
+            for f in out/*; do
+              mv "$f" "out/$(basename "$f" | sed 's/^openwrt-nss-/openwrt-nss-${{ matrix.variant }}-/')"
+            done
+          fi
+          (cd out && sha256sum * > sha256sums-${{ matrix.device }}-${{ matrix.variant }})
           ls -la out
 
       - name: Upload images
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
-          name: openwrt-nss-${{ matrix.device }}
+          name: openwrt-nss-${{ matrix.device }}-${{ matrix.variant }}
           path: out/
           retention-days: 30
 
@@ -112,7 +476,7 @@ jobs:
       contents: write
     steps:
       - name: Download images
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           path: out
           merge-multiple: true
@@ -124,4 +488,4 @@ jobs:
           gh release create "${{ github.ref_name }}" out/* \
             --repo "${{ github.repository }}" \
             --title "OpenWrt NSS ${{ github.ref_name }}" \
-            --notes "Images for the TP-Link Archer C2600 and the Netgear R7800, built from OpenWrt master. See the README for the test status."
+            --notes "Images for the Netgear R7800, built from OpenWrt master. See the README for the test status."
