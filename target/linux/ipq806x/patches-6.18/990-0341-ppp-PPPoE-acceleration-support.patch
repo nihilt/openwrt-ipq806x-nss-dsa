@@ -350,14 +350,6 @@ Signed-off-by: Murat Sezgin <quic_msezgin@quicinc.com>
  
  /* per-net private data for this module */
  static unsigned int pppoe_net_id __read_mostly;
-@@ -654,6 +655,7 @@ static int pppoe_connect(struct socket *
- 	if (stage_session(po->pppoe_pa.sid)) {
- 		pppox_unbind_sock(sk);
- 		pn = pppoe_pernet(sock_net(sk));
-+
- 		delete_item(pn, po->pppoe_pa.sid,
- 			    po->pppoe_pa.remote, po->pppoe_ifindex);
- 		if (po->pppoe_dev) {
 @@ -701,7 +703,7 @@ static int pppoe_connect(struct socket *
  
  		po->chan.mtu = dev->mtu - sizeof(struct pppoe_hdr) - 2;
