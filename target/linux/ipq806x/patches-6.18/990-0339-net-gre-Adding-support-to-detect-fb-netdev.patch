@@ -64,7 +64,7 @@ Signed-off-by: Swati Singh <quic_swasing@quicinc.com>
 +
  static void __gre_xmit(struct sk_buff *skb, struct net_device *dev,
  		       const struct iphdr *tnl_params,
- 		       __be16 proto)
+ 		       __be16 proto, const unsigned long *flags)
 --- a/net/ipv6/ip6_tunnel.c
 +++ b/net/ipv6/ip6_tunnel.c
 @@ -2459,6 +2459,26 @@ struct net *ip6_tnl_get_link_net(const s
